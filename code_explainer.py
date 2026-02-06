@@ -1,16 +1,13 @@
 # code_explainer.py
 
-"""
-Utilities to send code to an LLM and get a human-friendly explanation.
-
-This implementation uses OpenAI's Chat Completions API via the `openai` library.
-You can adapt it to another provider if you prefer.
-"""
-
 import os
 from typing import Optional
 
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load .env so we get OPENAI_API_KEY
+load_dotenv()
 
 
 class LLMConfigError(Exception):
@@ -24,10 +21,6 @@ class CodeExplainer:
     """
 
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini") -> None:
-        """
-        :param api_key: OpenAI API key. If None, reads from OPENAI_API_KEY env var.
-        :param model: Model name to use.
-        """
         key = api_key or os.getenv("OPENAI_API_KEY")
         if not key:
             raise LLMConfigError(
@@ -35,7 +28,6 @@ class CodeExplainer:
             )
 
         self.model = model
-        # Initialize OpenAI client
         self.client = OpenAI(api_key=key)
 
     def explain_code(self, code: str, file_path: str) -> str:
@@ -50,7 +42,7 @@ class CodeExplainer:
             "Explain the following Python file clearly and concisely for an intermediate developer.\n\n"
             f"File path: {file_path}\n\n"
             "Focus on:\n"
-            "- What the main purpose of the file is\n"
+            "- The main purpose of the file\n"
             "- What the key functions/classes do\n"
             "- Any interesting implementation details\n"
             "- How it might be used in the overall project\n\n"
@@ -61,13 +53,9 @@ class CodeExplainer:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
+                {"role": "user", "content": prompt},
             ],
             temperature=0.2,
         )
 
-        # Extract the assistant's message text
         return response.choices[0].message.content.strip()
