@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """code-reader — A TUI for browsing GitHub repositories."""
 
+import os
+import subprocess
 import sys
 from typing import Optional
 
+from openai import OpenAI
+from rich.markup import escape
 from rich.syntax import Syntax
 from rich.text import Text
 from textual import on, work
@@ -22,6 +26,35 @@ from textual.widgets import (
 from textual.widgets.tree import TreeNode
 
 from github_client import GitHubClient, RepoFile, RepoInfo
+
+
+def _get_openai_client() -> Optional[OpenAI]:
+    """Get an OpenAI-compatible client. Tries OPENAI_API_KEY first, then GitHub token."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        return OpenAI(api_key=api_key)
+
+    # Fall back to GitHub Models (OpenAI-compatible) via gh CLI token
+    gh_token = _gh_cli_token()
+    if gh_token:
+        return OpenAI(
+            api_key=gh_token,
+            base_url="https://models.inference.ai.azure.com",
+        )
+    return None
+
+
+def _gh_cli_token() -> Optional[str]:
+    """Try to get token from gh CLI."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 # ── File type detection ───────────────────────────────────────────────────────
@@ -247,6 +280,51 @@ class FilePreview(VerticalScroll):
         self.scroll_home(animate=False)
 
 
+class ChatPanel(Vertical):
+    """LLM chat panel for asking questions about code."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._log_text: str = ""
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "[bold #5eead4]💬 Ask about this code[/]\n[dim]Type a question below[/]",
+            id="chat-header",
+        )
+        with VerticalScroll(id="chat-messages"):
+            yield Static("", id="chat-log")
+        yield Input(
+            placeholder="Ask about this file...",
+            id="chat-input",
+        )
+
+    def append_message(self, role: str, content: str) -> None:
+        if role == "user":
+            new_line = f"\n[bold #818cf8]You:[/] {escape(content)}"
+        else:
+            new_line = f"\n[#94a3b8]{content}[/]"
+        self._log_text = (self._log_text + new_line).strip()
+        self.query_one("#chat-log", Static).update(self._log_text)
+        self.query_one("#chat-messages", VerticalScroll).scroll_end(animate=False)
+
+    def update_streaming(self, full_response: str) -> None:
+        """Update the last assistant message during streaming."""
+        marker = "\n[#94a3b8]"
+        idx = self._log_text.rfind(marker)
+        if idx >= 0:
+            base = self._log_text[:idx]
+        else:
+            base = self._log_text
+        self._log_text = f"{base}\n[#94a3b8]{escape(full_response)}[/]".strip()
+        self.query_one("#chat-log", Static).update(self._log_text)
+        self.query_one("#chat-messages", VerticalScroll).scroll_end(animate=False)
+
+    def clear_chat(self) -> None:
+        self._log_text = ""
+        self.query_one("#chat-log", Static).update("")
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 
@@ -298,7 +376,7 @@ class CodeReaderApp(App):
     }
 
     #file-tree {
-        height: 1fr;
+        height: 2fr;
         background: #0f172a;
         scrollbar-color: #334155;
         scrollbar-color-hover: #475569;
@@ -311,6 +389,45 @@ class CodeReaderApp(App):
     #file-tree > .tree--cursor {
         background: #1e1b4b;
         color: #e2e8f0;
+    }
+
+    #chat-panel {
+        height: 1fr;
+        min-height: 8;
+        background: #0f172a;
+        border-top: solid #334155;
+        padding: 0 0;
+    }
+
+    #chat-header {
+        height: 2;
+        padding: 0 1;
+        background: #1e293b;
+    }
+
+    #chat-messages {
+        height: 1fr;
+        background: #0f172a;
+        padding: 0 1;
+        scrollbar-color: #334155;
+        scrollbar-color-hover: #475569;
+    }
+
+    #chat-log {
+        width: 100%;
+    }
+
+    #chat-input {
+        dock: bottom;
+        margin: 0 0;
+        border: round #6366f1;
+        background: #1e293b;
+        color: #f8fafc;
+        height: 3;
+    }
+
+    #chat-input:focus {
+        border: round #818cf8;
     }
 
     #divider {
@@ -367,6 +484,7 @@ class CodeReaderApp(App):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("escape", "focus_input", "Back to input", show=False),
         Binding("ctrl+o", "show_overview", "Overview", show=True),
+        Binding("ctrl+l", "focus_chat", "Chat", show=True),
     ]
 
     def __init__(self) -> None:
@@ -377,6 +495,10 @@ class CodeReaderApp(App):
         self._repo_info: Optional[RepoInfo] = None
         self._languages: dict[str, int] = {}
         self._file_count: int = 0
+        self._current_file_path: str = ""
+        self._current_file_content: str = ""
+        self._openai: Optional[OpenAI] = None
+        self._chat_history: list[dict[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -388,6 +510,7 @@ class CodeReaderApp(App):
         with Horizontal(id="main-content"):
             with Vertical(id="tree-panel"):
                 yield Tree("Repository", id="file-tree")
+                yield ChatPanel(id="chat-panel")
             yield Static(id="divider")
             yield FilePreview(id="preview-panel")
         with Horizontal(id="status-bar"):
@@ -398,6 +521,7 @@ class CodeReaderApp(App):
             "[#6366f1]↑↓[/] navigate  "
             "[#6366f1]Enter[/] open file  "
             "[#6366f1]Ctrl+O[/] overview  "
+            "[#6366f1]Ctrl+L[/] chat  "
             "[#6366f1]Esc[/] quit",
             id="help-bar",
             markup=True,
@@ -408,6 +532,13 @@ class CodeReaderApp(App):
             self._client = GitHubClient()
         except ValueError as e:
             self.notify(str(e), severity="error", timeout=5)
+
+        # Initialize OpenAI-compatible client
+        self._openai = _get_openai_client()
+        if not self._openai:
+            self.query_one("#chat-panel", ChatPanel).append_message(
+                "assistant", "⚠ Set OPENAI_API_KEY to enable chat"
+            )
 
         tree = self.query_one("#file-tree", Tree)
         tree.show_root = False
@@ -529,6 +660,8 @@ class CodeReaderApp(App):
         )
         try:
             content = self._client.read_file(self._owner, self._repo, rf.path)
+            self._current_file_path = rf.path
+            self._current_file_content = content
             self.call_from_thread(
                 self.query_one("#preview-panel", FilePreview).show_file,
                 content,
@@ -560,6 +693,79 @@ class CodeReaderApp(App):
         if self._repo_info:
             self.query_one("#preview-panel", FilePreview).show_overview(
                 self._repo_info, self._languages
+            )
+
+    def action_focus_chat(self) -> None:
+        self.query_one("#chat-input", Input).focus()
+
+    @on(Input.Submitted, "#chat-input")
+    def on_chat_submitted(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        if not question:
+            return
+        event.input.value = ""
+
+        if not self._openai:
+            self.query_one("#chat-panel", ChatPanel).append_message(
+                "assistant", "⚠ OPENAI_API_KEY not set"
+            )
+            return
+
+        chat = self.query_one("#chat-panel", ChatPanel)
+        chat.append_message("user", question)
+        chat.append_message("assistant", "thinking...")
+
+        self._chat_history.append({"role": "user", "content": question})
+        self._stream_response(question)
+
+    @work(thread=True, exclusive=True, group="chat")
+    def _stream_response(self, question: str) -> None:
+        """Stream an OpenAI response in a background thread."""
+        system_msg = "You are a helpful code assistant. Answer concisely about the code shown. Use markdown formatting sparingly — keep answers short (2-5 sentences typically)."
+
+        if self._current_file_content:
+            context = (
+                f"The user is viewing `{self._current_file_path}` in repo "
+                f"`{self._owner}/{self._repo}`.\n\n"
+                f"File content:\n```\n{self._current_file_content[:12000]}\n```"
+            )
+        else:
+            context = (
+                f"The user is browsing repo `{self._owner}/{self._repo}`. "
+                "No specific file is selected."
+            )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "system", "content": context},
+        ]
+        # Include last few exchanges for continuity
+        messages.extend(self._chat_history[-6:])
+
+        try:
+            stream = self._openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                stream=True,
+                max_tokens=500,
+            )
+            full_response = ""
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    full_response += delta.content
+                    self.call_from_thread(
+                        self.query_one("#chat-panel", ChatPanel).update_streaming,
+                        full_response,
+                    )
+
+            self._chat_history.append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            self.call_from_thread(
+                self.query_one("#chat-panel", ChatPanel).update_streaming,
+                f"Error: {e}",
             )
 
 

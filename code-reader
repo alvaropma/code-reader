@@ -1,0 +1,2 @@
+#!/bin/bash
+cd /Users/alvaropma/opencode/tools/code-reader && uv run python app.py "$@"

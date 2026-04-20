@@ -9,4 +9,5 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "requests>=2.33.1",
     "textual>=8.2.4",
+    "openai>=1.82.0",
 ]
